@@ -2,7 +2,6 @@
 
 vendor('mixin.ACCOUNT.config');
 vendor('mixin.JWT.JWT');
-vendor('mixin.RSA.RSA');
 
 
 /**
@@ -28,21 +27,17 @@ class ACCOUNT
 
     public $privatekey;
 
-    /**
-     * 不传参数 是机器人账户，传了参数是mixin用户账户
-     * ACCOUNT constructor.
-     * @param array $options
-     */
+    public $pintoken;
+
     function __construct($options = []){
-        if(empty($options)) {
-            $this->pin = constant("PIN");
-            $this->aeskey = constant("AESKEY");
-            $this->client_id = constant("CLIENT_ID");
-            $this->session_id = constant("SESSION_ID");
-            $this->timeout = constant("TIMEOUT");
-            $handle = fopen(constant("PRIVATEKEY"),"r");
-            $this->privatekey = fread($handle, filesize (constant("PRIVATEKEY")));
-        }
+        $this->pin = constant("PIN");
+        $this->aeskey = constant("AESKEY");
+        $this->client_id = constant("CLIENT_ID");
+        $this->session_id = constant("SESSION_ID");
+        $this->timeout = constant("TIMEOUT");
+        $handle = fopen(constant("PRIVATEKEY"),"r");
+        $this->privatekey = fread($handle, filesize (constant("PRIVATEKEY")));
+        $this->pintoken = constant("PINTOKEN");
     }
 
     /**
@@ -56,6 +51,7 @@ class ACCOUNT
 
         $public_key = $key['pubKey']; //公钥
         $privKey = $key['privKey']; //私钥  ======>理论上私钥要保存到本地
+        echo $privKey;
 
         $lines = explode("\n",trim($public_key));
         array_splice($lines,count($lines) - 1,1);
@@ -82,32 +78,78 @@ class ACCOUNT
             'sig' => hash("sha256", $createuser_sig_str)
         );
 
-        $token = $this->jwtSign($payload,'RS512'); //生成token
+        $token = $this->jwtSign($payload,$this->privatekey,'RS512'); //生成token
 
         $header_data = array(
             "Authorization: Bearer ". $token,
             "Content-Type: application/json"
         );
+
         $result = $this->post('https://api.mixin.one/users',$header_data,$createuser_json_str);
         return $result;
     }
 
-    public function updatePin($oldpin,$newpin,$old){
+    /**
+     * Top Assets 资产列表
+     * @param $asset_id 资产ID 可不传值 若不传值，则返回所有资产
+     * @param $useroptions 用户信息
+     * @return mixed
+     */
+    public function readAssets($asset_id,$useroptions){
+        $transfer_sig_str = 'GET/assets';
+        $url = 'https://api.mixin.one/network';
+        if($asset_id && strlen($asset_id) == 36 ) {
+            $transfer_sig_str = 'GET/assets/' . $asset_id;
+            $url = 'https://api.mixin.one/assets/' . $asset_id;
+        }
+        $payload = array(
+            'uid' => $useroptions['client_id'],
+            'sid' => $useroptions['session_id'],
+            'jti' => $this->uuid(),
+            'sig' => hash("sha256", $transfer_sig_str)
+        );
+        $token = $this->jwtSign($payload,$useroptions['privatekey'],'RS512'); //生成token
+        $header_data = array(
+            "Authorization: Bearer ". $token,
+            "Content-Type: application/json"
+        );
+        $result = $this->get($url,$header_data);
+        return $result;
+    }
+    /**
+     * 更新Pin码
+     * 每个 Mixin 的用户都需要有一个 PIN 码，转帐要用。创建新用户的时候是不包含这个密码的，所以需要更新
+     * @param $oldpin
+     * @param $newpin
+     * @param $useroption
+     */
+    public function updatePin($oldpin,$newpin,$useroption){
 
+        $aeskey = $this->rsaEncrypt($useroption['pin_token'],$useroption['privatekey']);
+
+    //   return $this->encryptCustomPIN($newpin,$pintoken,$useroption['privatekey']);
     }
 
     /**
-     * JWTj加密 1
-     * @param $payload
-     * @param string $alg
-     * @return string Token
+     * 得到加密的PIN,很多接口操作需要
+     * @param $pincode
+     * @param $pintoken
+     * @param $privatekey
      */
-    private function jwtSign($payload,$alg = 'RS512')
+    public function encryptCustomPIN($pincode,$aeskeybase64){
+
+
+    }
+    // jwt加密
+    private function jwtSign($payload,$privatekey,$alg = 'RS512')
     {
+        if($privatekey == '') {
+            $privatekey = $this->privatekey;
+        }
         $jwtObj = new \JWT();
         $payload['iat'] = $_SERVER['REQUEST_TIME'];//签发时间(必填参数)
         $payload['exp'] = $_SERVER['REQUEST_TIME'] + $this->timeout;//过期时间(必填参数)
-        $jwt = $jwtObj::encode($payload, $this->privatekey ,$alg);
+        $jwt = $jwtObj::encode($payload, $privatekey ,$alg);
         return $jwt;
     }
 
@@ -124,20 +166,42 @@ class ACCOUNT
     {
         $config = array(
             "private_key_bits" => 1024,//位数
-            "private_key_type" => OPENSSL_KEYTYPE_RSA
+            "private_key_type" => OPENSSL_KEYTYPE_RSA,
+            "config" => "F:\phpstudy\PHPTutorial\Apache\conf\openssl.cnf"
         );
+
         $res = openssl_pkey_new($config);
         openssl_pkey_export($res, $privKey);//私钥
         $pubKey = openssl_pkey_get_details($res);
         $pubKey = $pubKey["key"];//公钥
         return array('privKey' => $privKey, 'pubKey' => $pubKey);
+
     }
 
     /**
-     * 随机返回一个UUID格式的字符串
-     * @param string $prefix
-     * @return string
+     * RSA 私钥解密
+     * @param $encryptedData 要解密的内容
+     * @param $privatekey 私钥
      */
+    public function rsaEncrypt($encryptedData,$privatekey){
+        $encryptedData	=	str_replace(' ','+', $encryptedData);
+        if (empty($encryptedData)) {
+            return '';
+        }
+        $encryptedData = base64_decode($encryptedData);
+
+        $decryptedList = array();
+        $step          = 512;    //解密长度限制
+        for ($i = 0, $len = strlen($encryptedData); $i < $len; $i += $step) {
+            $data      = substr($encryptedData, $i, $step);
+            $decrypted = '';
+            openssl_private_decrypt($data, $decrypted, $this->privatekey,3);
+            $decryptedList[] = $decrypted;
+        }
+
+        return join('', $decryptedList);
+    }
+
     public function uuid($prefix = '')
     {
         $chars = md5(uniqid(mt_rand(), true));
@@ -164,10 +228,19 @@ class ACCOUNT
         curl_close($ch);
         return $result;
     }
-    public function test(){
-        $result = $this->createUser('18841692393');
-        print_r($result);
-
+    public function get($url,$header_data){
+        $ch = curl_init();
+        curl_setopt ($ch, CURLOPT_URL,$url);
+        curl_setopt($ch,CURLOPT_HTTPHEADER,$header_data);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, FALSE);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, FALSE);
+        curl_setopt ($ch, CURLOPT_HEADER, 0);
+        curl_setopt($ch, CURLINFO_HEADER_OUT, true);
+        curl_setopt ($ch, CURLOPT_RETURNTRANSFER, 1);
+        $result = curl_exec ($ch);
+        curl_close($ch);
+        return $result;
     }
+
 
 }
